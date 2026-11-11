@@ -551,7 +551,25 @@ extension SensorsReader {
             return nil
         }
         
+        // macOS 27: Energy Model 的 mJ 计数器对无 entitlement 的进程冻结，改用 CLPC
+        Self.appendCLPCChannels(to: channel)
+        
         return channel
+    }
+    
+    private static func appendCLPCChannels(to channel: CFMutableDictionary) {
+        let extra = CLPCEnergy.channels()
+        guard !extra.isEmpty else { return }
+        
+        let key = "IOReportChannels" as CFString
+        guard let raw = CFDictionaryGetValue(channel, Unmanaged.passUnretained(key).toOpaque()) else { return }
+        let existing = Unmanaged<CFArray>.fromOpaque(raw).takeUnretainedValue()
+        guard let list = CFArrayCreateMutableCopy(kCFAllocatorDefault, 0, existing) else { return }
+        
+        for item in extra {
+            CFArrayAppendValue(list, Unmanaged.passUnretained(item).toOpaque())
+        }
+        CFDictionarySetValue(channel, Unmanaged.passUnretained(key).toOpaque(), Unmanaged.passUnretained(list).toOpaque())
     }
     
     private func initIOSensors() -> [Sensor] {
@@ -585,29 +603,38 @@ extension SensorsReader {
         let prevRAM = self.powers.RAM
         let prevPCI = self.powers.PCI
         
+        // macOS 27 的 CLPC 通道优先（Energy Model 的 mJ 计数器在该系统上可能冻结）
+        var clpc: (CPU: Double?, GPU: Double?, ANE: Double?, RAM: Double?) = (nil, nil, nil, nil)
+        
         for i in 0..<CFArrayGetCount(items) {
             let dict = CFArrayGetValueAtIndex(items, i)
             let item = unsafeBitCast(dict, to: CFDictionary.self)
             
             guard let group = IOReportChannelGetGroup(item)?.takeUnretainedValue() as? String,
-                  group == "Energy Model",
+                  group == "Energy Model" || group == "CLPC",
                   let channel = IOReportChannelGetChannelName(item)?.takeUnretainedValue() as? String,
                   let unit = IOReportChannelGetUnitLabel(item)?.takeUnretainedValue() as? String else { continue }
             
-            let value = Double(IOReportSimpleGetIntegerValue(item, 0))
+            let value = Double(IOReportSimpleGetIntegerValue(item, 0)).power(unit)
+            let isCLPC = group == "CLPC"
             
             if channel.hasSuffix("CPU Energy") {
-                self.powers.CPU = value.power(unit)
+                if isCLPC { clpc.CPU = value } else if clpc.CPU == nil { self.powers.CPU = value }
             } else if channel.hasSuffix("GPU Energy") {
-                self.powers.GPU = value.power(unit)
+                if isCLPC { clpc.GPU = value } else if clpc.GPU == nil { self.powers.GPU = value }
             } else if channel.starts(with: "ANE") {
-                self.powers.ANE = value.power(unit)
+                if isCLPC { clpc.ANE = value } else if clpc.ANE == nil { self.powers.ANE = value }
             } else if channel.starts(with: "DRAM") {
-                self.powers.RAM = value.power(unit)
+                if isCLPC { clpc.RAM = value } else if clpc.RAM == nil { self.powers.RAM = value }
             } else if channel.starts(with: "PCI") && channel.hasSuffix("Energy") {
-                self.powers.PCI = value.power(unit)
+                self.powers.PCI = value
             }
         }
+        
+        if let value = clpc.CPU { self.powers.CPU = value }
+        if let value = clpc.GPU { self.powers.GPU = value }
+        if let value = clpc.ANE { self.powers.ANE = value }
+        if let value = clpc.RAM { self.powers.RAM = value }
         
         guard let lastIOSensorsRead = self.lastIOSensorsRead else {
             self.lastIOSensorsRead = now
